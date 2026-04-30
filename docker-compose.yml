@@ -1,0 +1,127 @@
+# =============================================================================
+# tts-elk — single-node ELK stack + forwarder for The Things Stack events.
+#
+# Lab / demo defaults: HTTP (no TLS) between containers, but with X-Pack
+# security and authentication enabled. For production hardening see
+# README §10 — Operational considerations.
+# =============================================================================
+
+services:
+
+  # ---- Elasticsearch ------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: tts-elk-elasticsearch
+    environment:
+      - node.name=es01
+      - cluster.name=tts-events
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=basic
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    mem_limit: ${ES_MEM_LIMIT}
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "${ELASTICSEARCH_PORT}:9200"
+    networks: [ elk ]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -E '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+
+  # ---- One-shot setup: kibana_system password + ILM + index template -----
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: tts-elk-setup
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - KIBANA_PASSWORD=${KIBANA_PASSWORD}
+      - RETENTION_DAYS=${RETENTION_DAYS}
+    volumes:
+      - ./elasticsearch:/setup:ro
+    networks: [ elk ]
+    entrypoint: [ "/bin/bash", "/setup/setup.sh" ]
+    restart: "no"
+
+  # ---- Kibana --------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: tts-elk-kibana
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+      setup: { condition: service_completed_successfully }
+    environment:
+      - SERVER_NAME=tts-elk-kibana
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - XPACK_SECURITY_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - XPACK_REPORTING_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+    mem_limit: ${KB_MEM_LIMIT}
+    ports:
+      - "${KIBANA_PORT}:5601"
+    networks: [ elk ]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+
+  # ---- Logstash ------------------------------------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
+    container_name: tts-elk-logstash
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+      setup: { condition: service_completed_successfully }
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - LS_JAVA_OPTS=${LS_JAVA_OPTS}
+    mem_limit: ${LS_MEM_LIMIT}
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    networks: [ elk ]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600 >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  # ---- Forwarder -----------------------------------------------------------
+  forwarder:
+    build: ./forwarder
+    container_name: tts-elk-forwarder
+    depends_on:
+      logstash: { condition: service_healthy }
+    environment:
+      - TTS_HOST=${TTS_HOST}
+      - TTS_API_KEY=${TTS_API_KEY}
+      - TTS_INSECURE=${TTS_INSECURE}
+      - SUBSCRIBE_KINDS=${SUBSCRIBE_KINDS}
+      - EVENT_NAMES_REGEX=${EVENT_NAMES_REGEX}
+      - REFRESH_INTERVAL=${REFRESH_INTERVAL}
+      - STATIC_IDENTIFIERS=${STATIC_IDENTIFIERS}
+      - LOGSTASH_HOST=logstash
+      - LOGSTASH_PORT=5044
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+    networks: [ elk ]
+
+volumes:
+  esdata:
+
+networks:
+  elk:
+    driver: bridge

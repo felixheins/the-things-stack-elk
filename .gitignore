@@ -1,0 +1,13 @@
+.env
+*.log
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# Tooling-local state — may contain session metadata, paths, or transcripts
+.claude/
+.aider*
+.cursor/
