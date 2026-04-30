@@ -19,6 +19,8 @@ fields, and writes to a time-based Elasticsearch data stream governed by
 an ILM policy.
 
 > **Status:** demo / lab. See [§10 Going to production](#10-going-to-production) for what to harden before running it for real.
+>
+> Looking for a self-contained article (no clone needed, all config inline)? See [`docs/logging-events-to-elk.md`](docs/logging-events-to-elk.md).
 
 ---
 
