@@ -85,7 +85,7 @@ TTS_HOST=<tenant>.eu1.cloud.thethings.industries
 TTS_API_KEY=NNSXS.replace-me
 TTS_INSECURE=false
 
-SUBSCRIBE_KINDS=applications,gateways,organizations,users,clients
+SUBSCRIBE_KINDS=applications,gateways,organizations,users,clients,end_devices
 EVENT_NAMES_REGEX=/.+/
 REFRESH_INTERVAL=300
 STATIC_IDENTIFIERS=
@@ -105,7 +105,18 @@ LS_MEM_LIMIT=1g
 KIBANA_PORT=5601
 ELASTICSEARCH_PORT=9200
 RETENTION_DAYS=90
+
+# Logstash → Elasticsearch endpoint. Defaults to the in-stack ES; override
+# to target Elastic Cloud / a managed cluster (see Going to Production).
+ES_HOSTS=http://elasticsearch:9200
+ES_USER=elastic
+ES_PASSWORD=${ELASTIC_PASSWORD}
+DATA_STREAM_NAMESPACE=default
 ```
+
+##### Note:
+
+`SUBSCRIBE_KINDS` includes `end_devices` so device-scoped API keys (no application-list rights) can stream traffic via `STATIC_IDENTIFIERS`. For tenant-wide keys it is functionally redundant — TTS hierarchical identifier matching means events for a device are also delivered through the parent application's subscription, and the forwarder uses the The Things Stack `unique_id` as the Elasticsearch document `_id` so duplicates collapse to a single document.
 
 ##### Warning:
 
@@ -182,8 +193,11 @@ services:
       elasticsearch: { condition: service_healthy }
       setup: { condition: service_completed_successfully }
     environment:
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - LS_JAVA_OPTS=${LS_JAVA_OPTS}
+      - ES_HOSTS=${ES_HOSTS:-http://elasticsearch:9200}
+      - ES_USER=${ES_USER:-elastic}
+      - ES_PASSWORD=${ES_PASSWORD:-${ELASTIC_PASSWORD}}
+      - DATA_STREAM_NAMESPACE=${DATA_STREAM_NAMESPACE:-default}
     mem_limit: ${LS_MEM_LIMIT}
     volumes:
       - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
@@ -212,6 +226,12 @@ services:
       - LOG_LEVEL=INFO
     restart: unless-stopped
     networks: [ elk ]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/forwarder-alive && [ $(($(date +%s) - $(stat -c %Y /tmp/forwarder-alive))) -lt 90 ]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
 volumes:
   esdata:
@@ -371,13 +391,13 @@ filter {
 
 output {
   elasticsearch {
-    hosts    => ["http://elasticsearch:9200"]
-    user     => "elastic"
-    password => "${ELASTIC_PASSWORD}"
+    hosts    => ["${ES_HOSTS:http://elasticsearch:9200}"]
+    user     => "${ES_USER:elastic}"
+    password => "${ES_PASSWORD}"
     data_stream           => "true"
     data_stream_type      => "logs"
     data_stream_dataset   => "tts.events"
-    data_stream_namespace => "default"
+    data_stream_namespace => "${DATA_STREAM_NAMESPACE:default}"
     document_id => "%{unique_id}"
   }
 }
@@ -410,7 +430,7 @@ httpx==0.27.2
 Save the following as `forwarder/forwarder.py`:
 
 ```
-import asyncio, json, logging, os, signal, socket, sys
+import asyncio, json, logging, os, pathlib, signal, sys, time
 from typing import Any, Iterable
 import httpx
 
@@ -421,10 +441,11 @@ LS_HOST      = os.environ.get("LOGSTASH_HOST", "logstash")
 LS_PORT      = int(os.environ.get("LOGSTASH_PORT", "5044"))
 REFRESH      = int(os.environ.get("REFRESH_INTERVAL", "300"))
 KINDS        = tuple(k.strip() for k in os.environ.get(
-    "SUBSCRIBE_KINDS", "applications,gateways,organizations,users,clients"
+    "SUBSCRIBE_KINDS", "applications,gateways,organizations,users,clients,end_devices"
 ).split(",") if k.strip())
 NAMES_REGEX  = os.environ.get("EVENT_NAMES_REGEX", "/.+/")
 LOG_LEVEL    = os.environ.get("LOG_LEVEL", "INFO").upper()
+HEARTBEAT    = pathlib.Path("/tmp/forwarder-alive")
 
 STATIC_IDENTIFIERS: dict[str, list[dict]] = {}
 raw = os.environ.get("STATIC_IDENTIFIERS", "").strip()
@@ -442,9 +463,26 @@ META = {
   "organizations": {"path": "organizations", "key": "organizations", "field": "organization_ids"},
   "users":         {"path": "users",         "key": "users",         "field": "user_ids"},
   "clients":       {"path": "clients",       "key": "clients",       "field": "client_ids"},
+  "end_devices":   {"path": None,            "key": "end_devices",   "field": "end_device_ids"},
 }
 
 async def list_entities(client: httpx.AsyncClient, kind: str) -> list[dict]:
+    if kind == "end_devices":
+        # End devices have no top-level list endpoint — walk applications.
+        out = []
+        for app in await list_entities(client, "applications"):
+            app_id = (app.get("ids") or {}).get("application_id")
+            if not app_id: continue
+            page = 1
+            while True:
+                r = await client.get(f"{BASE}/applications/{app_id}/devices",
+                                     headers=HEADERS, params={"limit": 1000, "page": page}, timeout=30)
+                if r.status_code == 403: break
+                r.raise_for_status()
+                items = r.json().get("end_devices") or []
+                if not items: break
+                out.extend(items); page += 1
+        return out
     out, page = [], 1
     while True:
         r = await client.get(f"{BASE}/{META[kind]['path']}", headers=HEADERS,
@@ -455,6 +493,14 @@ async def list_entities(client: httpx.AsyncClient, kind: str) -> list[dict]:
         items = r.json().get(META[kind]["key"], []) or []
         if not items: return out
         out.extend(items); page += 1
+
+async def heartbeat(stop):
+    """Touch a file every 30s so the docker-compose healthcheck has a signal."""
+    while not stop.is_set():
+        try: HEARTBEAT.write_text(str(int(time.time())))
+        except OSError: pass
+        try: await asyncio.wait_for(stop.wait(), timeout=30)
+        except asyncio.TimeoutError: pass
 
 class Sink:
     def __init__(self, host, port):
@@ -537,6 +583,7 @@ async def main():
     sink = Sink(LS_HOST, LS_PORT)
     async with httpx.AsyncClient(verify=not TTS_INSECURE) as client:
         ws = [asyncio.create_task(subscribe(client, k, sink, stop)) for k in KINDS if k in META]
+        ws.append(asyncio.create_task(heartbeat(stop)))
         await stop.wait()
         for w in ws: w.cancel()
         await asyncio.gather(*ws, return_exceptions=True)
@@ -595,6 +642,39 @@ event_component : "is" and event_category : "oauth"
 event_component : "as" and event_category : "up"
 ```
 
+### An Example Alert Rule — Ingest Lag
+
+The single highest-signal alarm is "no events have been indexed in the last few minutes": it catches forwarder hangs, Events API outages, and Logstash backpressure with one rule. Create it via the Kibana Alerting API:
+
+```
+curl -fsS -u elastic:<password> \
+  -H 'Content-Type: application/json' -H 'kbn-xsrf: true' \
+  -X POST http://localhost:5601/api/alerting/rule \
+  -d @- <<'JSON'
+{
+  "name": "TTS events ingest lag",
+  "tags": ["tts-elk"],
+  "rule_type_id": ".es-query",
+  "consumer": "alerts",
+  "schedule": { "interval": "1m" },
+  "params": {
+    "searchType": "esQuery",
+    "index": ["logs-tts.events-*"],
+    "timeField": "@timestamp",
+    "esQuery": "{\"query\":{\"match_all\":{}}}",
+    "size": 0,
+    "thresholdComparator": "<",
+    "threshold": [1],
+    "timeWindowSize": 5,
+    "timeWindowUnit": "m"
+  },
+  "actions": []
+}
+JSON
+```
+
+The rule fires when fewer than 1 document is indexed in the last 5 minutes. Wire it to a connector (Slack, email, PagerDuty) by populating the empty `"actions"` array; see the [Kibana Alerting documentation](https://www.elastic.co/guide/en/kibana/current/create-and-manage-rules.html) for the connector schema.
+
 ## Subscribing Without List Rights
 
 If your API key has `*_INFO` and `*_TRAFFIC_READ` rights but not the user-level `*_LIST` rights, the forwarder cannot enumerate entities. Set `STATIC_IDENTIFIERS` in `.env` to a JSON object keyed by kind:
@@ -605,6 +685,29 @@ SUBSCRIBE_KINDS=gateways,applications
 ```
 
 The forwarder will skip discovery entirely and subscribe directly to the supplied identifiers.
+
+For end devices use the [`EndDeviceIdentifiers`](https://www.thethingsindustries.com/docs/api/reference/grpc/end_device/) shape — the device ID alongside its parent application:
+
+```
+STATIC_IDENTIFIERS={"end_devices":[{"device_id":"my-dev","application_ids":{"application_id":"my-app"}}]}
+SUBSCRIBE_KINDS=end_devices
+```
+
+This is the case where `end_devices` carries its weight — typically a key issued to a per-device collaborator that has neither application-list nor application-info rights.
+
+## Targeting an External Elasticsearch
+
+The Logstash output is fully environment-driven, so pointing the pipeline at Elastic Cloud or a managed cluster needs no code change. Override the connection variables in `.env`:
+
+```
+ES_HOSTS=https://my-deployment.es.eu-west-1.aws.found.io:9243
+ES_USER=elastic
+ES_PASSWORD=your-cloud-password
+```
+
+Then start only the components you need (`docker compose up -d logstash forwarder`); the bundled `elasticsearch` and `kibana` services become unused. The setup script in `elasticsearch/setup.sh` runs the curl calls that install the ILM policy and the index template — you can run them by hand against any cluster by setting `ES` and `AUTH` to the external endpoint, or skip them and rely on auto-created mappings.
+
+For self-managed clusters with a private CA, mount the CA file into the Logstash container and add `cacert => "/path/to/ca.pem"` next to the `hosts` line in the Elasticsearch output.
 
 ## Going to Production
 

@@ -19,8 +19,10 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import signal
 import sys
+import time
 from typing import Any, Iterable
 
 import httpx
@@ -41,12 +43,26 @@ REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", "300"))
 
 # Comma-separated list of identifier kinds to subscribe to. Useful for
 # scoping in tests, or for splitting load across multiple forwarders.
+#
+# `end_devices` is included so device-scoped API keys (no application-list
+# rights) can still feed device traffic via STATIC_IDENTIFIERS. For
+# tenant-wide keys with application-list rights it is functionally
+# redundant — TTS hierarchical identifier matching means events for a
+# device are already delivered through the parent application's
+# subscription, and the forwarder uses TTS's `unique_id` as the ES `_id`
+# so any duplicate is overwritten, not stored twice.
 KINDS = tuple(
     k.strip() for k in os.environ.get(
         "SUBSCRIBE_KINDS",
-        "applications,gateways,organizations,users,clients",
+        "applications,gateways,organizations,users,clients,end_devices",
     ).split(",") if k.strip()
 )
+
+# Heartbeat file for the docker-compose healthcheck. The forwarder
+# `touch`es this file on a timer regardless of event flow so a quiet
+# deployment isn't reported as unhealthy.
+HEARTBEAT_FILE = pathlib.Path(os.environ.get("HEARTBEAT_FILE", "/tmp/forwarder-alive"))
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 
 # Optional regex filter on event names ('.+' = everything, the default).
 EVENT_NAMES_REGEX = os.environ.get("EVENT_NAMES_REGEX", "/.+/")
@@ -91,6 +107,10 @@ HEADERS = {
 
 # Per-kind metadata: list endpoint, response key, and how to project the
 # listed object into an EntityIdentifiers oneof.
+#
+# `end_devices` has no top-level list endpoint in TTS — devices are
+# nested under their application, so list_entities() handles it as a
+# special case below by walking applications first.
 KIND_META: dict[str, dict[str, Any]] = {
     "applications": {
         "list_path": "applications",
@@ -117,11 +137,18 @@ KIND_META: dict[str, dict[str, Any]] = {
         "list_key": "clients",
         "ids_field": "client_ids",
     },
+    "end_devices": {
+        "list_path": None,
+        "list_key": "end_devices",
+        "ids_field": "end_device_ids",
+    },
 }
 
 
 async def list_entities(client: httpx.AsyncClient, kind: str) -> list[dict]:
     """Page through a TTS list endpoint for the given entity kind."""
+    if kind == "end_devices":
+        return await _list_end_devices(client)
     meta = KIND_META[kind]
     out: list[dict] = []
     page = 1
@@ -141,6 +168,34 @@ async def list_entities(client: httpx.AsyncClient, kind: str) -> list[dict]:
             return out
         out.extend(items)
         page += 1
+
+
+async def _list_end_devices(client: httpx.AsyncClient) -> list[dict]:
+    """End devices are nested under applications — walk apps then list devices."""
+    apps = await list_entities(client, "applications")
+    out: list[dict] = []
+    for app in apps:
+        app_id = (app.get("ids") or {}).get("application_id")
+        if not app_id:
+            continue
+        page = 1
+        while True:
+            r = await client.get(
+                f"{BASE}/applications/{app_id}/devices",
+                headers=HEADERS,
+                params={"limit": 1000, "page": page},
+                timeout=30,
+            )
+            if r.status_code == 403:
+                log.info("api key cannot list devices in %s — skipping", app_id)
+                break
+            r.raise_for_status()
+            items = r.json().get("end_devices") or []
+            if not items:
+                break
+            out.extend(items)
+            page += 1
+    return out
 
 
 def to_identifiers(kind: str, entities: Iterable[dict]) -> list[dict]:
@@ -323,6 +378,16 @@ async def _sleep_or_stop(seconds: float, stop: asyncio.Event) -> None:
         return
 
 
+async def heartbeat(stop: asyncio.Event) -> None:
+    """Touch HEARTBEAT_FILE on a timer so the compose healthcheck has a signal."""
+    while not stop.is_set():
+        try:
+            HEARTBEAT_FILE.write_text(str(int(time.time())))
+        except OSError as e:
+            log.warning("heartbeat write failed: %s", e)
+        await _sleep_or_stop(HEARTBEAT_INTERVAL, stop)
+
+
 # ---------- main ------------------------------------------------------------
 
 
@@ -344,7 +409,8 @@ async def main() -> None:
             for kind in KINDS
             if kind in KIND_META
         ]
-        log.info("started %d subscription workers: %s", len(workers), ", ".join(KINDS))
+        workers.append(asyncio.create_task(heartbeat(stop), name="heartbeat"))
+        log.info("started %d subscription workers: %s", len(workers) - 1, ", ".join(KINDS))
         await stop.wait()
         log.info("shutting down...")
         for w in workers:

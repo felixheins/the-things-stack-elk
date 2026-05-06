@@ -1,1 +1,0 @@
-{"attributes":{"fieldFormatMap":"{}","name":"tts-events","runtimeFieldMap":"{}","timeFieldName":"@timestamp","title":"logs-tts.events-*"},"coreMigrationVersion":"8.8.0","id":"tts-events","references":[],"type":"index-pattern","typeMigrationVersion":"8.0.0","version":"1"}

@@ -79,6 +79,11 @@ services:
       retries: 30
 
   # ---- Logstash ------------------------------------------------------------
+  #
+  # Output target defaults to the in-stack Elasticsearch but every field is
+  # env-driven, so pointing at Elastic Cloud or a managed cluster is just a
+  # matter of overriding ES_HOSTS / ES_USER / ES_PASSWORD in `.env`. See
+  # README §8 for the recipe.
   logstash:
     image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
     container_name: tts-elk-logstash
@@ -86,8 +91,11 @@ services:
       elasticsearch: { condition: service_healthy }
       setup: { condition: service_completed_successfully }
     environment:
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - LS_JAVA_OPTS=${LS_JAVA_OPTS}
+      - ES_HOSTS=${ES_HOSTS:-http://elasticsearch:9200}
+      - ES_USER=${ES_USER:-elastic}
+      - ES_PASSWORD=${ES_PASSWORD:-${ELASTIC_PASSWORD}}
+      - DATA_STREAM_NAMESPACE=${DATA_STREAM_NAMESPACE:-default}
     mem_limit: ${LS_MEM_LIMIT}
     volumes:
       - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
@@ -118,6 +126,14 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
     networks: [ elk ]
+    healthcheck:
+      # File mtime check against a heartbeat the forwarder touches every 30s.
+      # `start_period` covers the first heartbeat write after container start.
+      test: ["CMD-SHELL", "test -f /tmp/forwarder-alive && [ $(($(date +%s) - $(stat -c %Y /tmp/forwarder-alive))) -lt 90 ]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
 volumes:
   esdata:
