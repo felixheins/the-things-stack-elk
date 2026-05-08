@@ -67,6 +67,7 @@ curl -fsS -u "$AUTH" -X PUT "$ES/_component_template/tts-events-mappings" \
         "device_id":         { "type": "keyword" },
         "dev_eui":           { "type": "keyword" },
         "join_eui":          { "type": "keyword" },
+        "dev_addr":          { "type": "keyword" },
         "organization_id":   { "type": "keyword" },
         "user_id":           { "type": "keyword" },
         "client_id":         { "type": "keyword" },
