@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import os
-import pathlib
 import signal
 import sys
 import time
@@ -58,11 +57,18 @@ KINDS = tuple(
     ).split(",") if k.strip()
 )
 
-# Heartbeat file for the docker-compose healthcheck. The forwarder
-# `touch`es this file on a timer regardless of event flow so a quiet
-# deployment isn't reported as unhealthy.
-HEARTBEAT_FILE = pathlib.Path(os.environ.get("HEARTBEAT_FILE", "/tmp/forwarder-alive"))
+# Liveness signal: an in-memory timestamp updated on a timer regardless of
+# event flow, exposed via the HTTP `/healthz` endpoint below. Independent
+# of event flow so a quiet deployment isn't reported as unhealthy. The
+# endpoint responds 503 if the timestamp is older than 3× HEARTBEAT_INTERVAL.
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+
+# HTTP health endpoint. Bind to all interfaces by default so a k8s
+# httpGet liveness probe (which dials the pod IP) can reach it.
+HEALTH_BIND = os.environ.get("HEALTH_BIND", "0.0.0.0")
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+
+_last_heartbeat: float = 0.0
 
 # Optional regex filter on event names ('.+' = everything, the default).
 EVENT_NAMES_REGEX = os.environ.get("EVENT_NAMES_REGEX", "/.+/")
@@ -140,7 +146,10 @@ KIND_META: dict[str, dict[str, Any]] = {
     "end_devices": {
         "list_path": None,
         "list_key": "end_devices",
-        "ids_field": "end_device_ids",
+        # The EntityIdentifiers oneof case for EndDeviceIdentifiers is
+        # `device_ids` in api/identifiers.proto, not `end_device_ids` —
+        # the latter is the entity-collection name, not the proto field.
+        "ids_field": "device_ids",
     },
 }
 
@@ -160,8 +169,10 @@ async def list_entities(client: httpx.AsyncClient, kind: str) -> list[dict]:
             timeout=30,
         )
         if r.status_code == 403:
-            log.info("api key has no rights to list %s — skipping", kind)
+            log.warning("api key has no rights to list %s — skipping", kind)
             return []
+        if r.status_code == 401:
+            log.error("api key invalid or expired (401 from /%s) — check TTS_API_KEY", meta["list_path"])
         r.raise_for_status()
         items = r.json().get(meta["list_key"], []) or []
         if not items:
@@ -187,8 +198,10 @@ async def _list_end_devices(client: httpx.AsyncClient) -> list[dict]:
                 timeout=30,
             )
             if r.status_code == 403:
-                log.info("api key cannot list devices in %s — skipping", app_id)
+                log.warning("api key cannot list devices in %s — skipping", app_id)
                 break
+            if r.status_code == 401:
+                log.error("api key invalid or expired (401 from /applications/%s/devices) — check TTS_API_KEY", app_id)
             r.raise_for_status()
             items = r.json().get("end_devices") or []
             if not items:
@@ -261,6 +274,22 @@ class LogstashSink:
 # ---------- SSE parser ------------------------------------------------------
 
 
+def _unwrap_envelope(env: dict) -> dict | None:
+    """Pull the Event out of a gRPC-Gateway streaming envelope.
+
+    The Events API streaming response schema (per api.swagger.json) is
+    ``{"result": <Event>, "error": <google.rpc.Status>}``. Mid-stream
+    error frames carry no `result` and must not be forwarded to Logstash
+    as if they were events — they would index as malformed docs (no
+    `unique_id`, `name`, or `time`). Log and skip them; let the outer
+    reconnect loop decide whether to retry.
+    """
+    if isinstance(env, dict) and "error" in env and "result" not in env:
+        log.warning("stream error frame: %s", json.dumps(env["error"])[:500])
+        return None
+    return env.get("result", env) if isinstance(env, dict) else None
+
+
 async def iter_stream_events(response: httpx.Response):
     """Yield decoded events from a TTS streaming response.
 
@@ -272,7 +301,8 @@ async def iter_stream_events(response: httpx.Response):
     * raw NDJSON lines starting with ``{`` (current TTS behaviour), and
     * proper SSE ``data:`` lines (defensive — in case framing changes).
 
-    The gRPC-Gateway envelope ``{"result": ...}`` is unwrapped before yield.
+    The gRPC-Gateway envelope ``{"result": ...}`` is unwrapped before yield;
+    ``{"error": ...}`` frames are logged and dropped.
     """
     buf: list[str] = []
     async for raw in response.aiter_lines():
@@ -286,7 +316,9 @@ async def iter_stream_events(response: httpx.Response):
             except json.JSONDecodeError:
                 log.warning("bad JSON in stream payload: %s", payload[:200])
                 continue
-            yield env.get("result", env)
+            evt = _unwrap_envelope(env)
+            if evt is not None:
+                yield evt
             continue
         if raw.startswith(":"):
             continue  # SSE comment / keepalive
@@ -304,7 +336,9 @@ async def iter_stream_events(response: httpx.Response):
             except json.JSONDecodeError:
                 buf.append(raw)  # might be a partial; keep buffering
                 continue
-            yield env.get("result", env)
+            evt = _unwrap_envelope(env)
+            if evt is not None:
+                yield evt
             continue
         # Unknown framing line (event:, id:, retry:, …) — ignore.
 
@@ -347,6 +381,8 @@ async def subscribe_kind(
             ) as r:
                 if r.status_code != 200:
                     text = (await r.aread()).decode(errors="replace")[:500]
+                    if r.status_code == 401:
+                        log.error("[%s] api key invalid or expired (401) — check TTS_API_KEY", kind)
                     log.error("[%s] subscribe failed %d: %s", kind, r.status_code, text)
                     raise httpx.HTTPStatusError("bad status", request=r.request, response=r)
 
@@ -379,13 +415,95 @@ async def _sleep_or_stop(seconds: float, stop: asyncio.Event) -> None:
 
 
 async def heartbeat(stop: asyncio.Event) -> None:
-    """Touch HEARTBEAT_FILE on a timer so the compose healthcheck has a signal."""
+    """Update the in-memory liveness timestamp served by /healthz."""
+    global _last_heartbeat
     while not stop.is_set():
-        try:
-            HEARTBEAT_FILE.write_text(str(int(time.time())))
-        except OSError as e:
-            log.warning("heartbeat write failed: %s", e)
+        _last_heartbeat = time.time()
         await _sleep_or_stop(HEARTBEAT_INTERVAL, stop)
+
+
+# ---------- HTTP health endpoint -------------------------------------------
+#
+# Tiny hand-rolled HTTP/1.1 server so liveness probes (k8s httpGet, compose
+# healthcheck) get a 200 OK while the heartbeat task is ticking, and a 503
+# once the timestamp goes stale. Stdlib only — no aiohttp dep.
+
+
+async def _health_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    try:
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        except asyncio.TimeoutError:
+            return
+        # Drain the request headers — we don't inspect them.
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+        try:
+            method, path, _ = request_line.decode("ascii", "replace").split(" ", 2)
+        except ValueError:
+            await _write_response(writer, 400, b"bad request\n")
+            return
+
+        if method != "GET" or path.split("?", 1)[0] not in ("/healthz", "/livez"):
+            await _write_response(writer, 404, b"not found\n")
+            return
+
+        age = time.time() - _last_heartbeat if _last_heartbeat else float("inf")
+        ok = age < HEARTBEAT_INTERVAL * 3
+        body = json.dumps(
+            {
+                "status": "ok" if ok else "stale",
+                "heartbeat_age_seconds": round(age, 1) if _last_heartbeat else None,
+            },
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        await _write_response(writer, 200 if ok else 503, body, content_type="application/json")
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _write_response(
+    writer: asyncio.StreamWriter,
+    status: int,
+    body: bytes,
+    content_type: str = "text/plain",
+) -> None:
+    reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 503: "Service Unavailable"}.get(
+        status, "OK"
+    )
+    head = (
+        f"HTTP/1.1 {status} {reason}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    writer.write(head + body)
+    await writer.drain()
+
+
+async def health_server(stop: asyncio.Event) -> None:
+    server = await asyncio.start_server(_health_handler, HEALTH_BIND, HEALTH_PORT)
+    log.info("health endpoint listening on http://%s:%d/healthz", HEALTH_BIND, HEALTH_PORT)
+    try:
+        async with server:
+            await stop.wait()
+    finally:
+        server.close()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
 
 
 # ---------- main ------------------------------------------------------------
@@ -409,8 +527,10 @@ async def main() -> None:
             for kind in KINDS
             if kind in KIND_META
         ]
+        sub_count = len(workers)
         workers.append(asyncio.create_task(heartbeat(stop), name="heartbeat"))
-        log.info("started %d subscription workers: %s", len(workers) - 1, ", ".join(KINDS))
+        workers.append(asyncio.create_task(health_server(stop), name="health"))
+        log.info("started %d subscription workers: %s", sub_count, ", ".join(KINDS))
         await stop.wait()
         log.info("shutting down...")
         for w in workers:

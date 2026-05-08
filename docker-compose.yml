@@ -7,7 +7,6 @@
 # =============================================================================
 
 services:
-
   # ---- Elasticsearch ------------------------------------------------------
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
@@ -30,9 +29,13 @@ services:
       - esdata:/usr/share/elasticsearch/data
     ports:
       - "${ELASTICSEARCH_PORT}:9200"
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -E '\"status\":\"(green|yellow)\"'"]
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -E ''"status":"(green|yellow)"''',
+        ]
       interval: 10s
       timeout: 5s
       retries: 60
@@ -49,8 +52,8 @@ services:
       - RETENTION_DAYS=${RETENTION_DAYS}
     volumes:
       - ./elasticsearch:/setup:ro
-    networks: [ elk ]
-    entrypoint: [ "/bin/bash", "/setup/setup.sh" ]
+    networks: [elk]
+    entrypoint: ["/bin/bash", "/setup/setup.sh"]
     restart: "no"
 
   # ---- Kibana --------------------------------------------------------------
@@ -71,9 +74,13 @@ services:
     mem_limit: ${KB_MEM_LIMIT}
     ports:
       - "${KIBANA_PORT}:5601"
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS http://localhost:5601/api/status | grep -q ''"level":"available"''',
+        ]
       interval: 15s
       timeout: 5s
       retries: 30
@@ -100,7 +107,7 @@ services:
     volumes:
       - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
       - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9600 >/dev/null"]
       interval: 15s
@@ -125,11 +132,19 @@ services:
       - LOGSTASH_PORT=5044
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      # File mtime check against a heartbeat the forwarder touches every 30s.
-      # `start_period` covers the first heartbeat write after container start.
-      test: ["CMD-SHELL", "test -f /tmp/forwarder-alive && [ $(($(date +%s) - $(stat -c %Y /tmp/forwarder-alive))) -lt 90 ]"]
+      # HTTP probe against the forwarder's /healthz endpoint. The image is
+      # `python:3.12-slim` (no curl), so we use stdlib urllib — it raises on
+      # any non-2xx response, which exits the python process non-zero.
+      # `start_period` covers boot + the first heartbeat tick.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
