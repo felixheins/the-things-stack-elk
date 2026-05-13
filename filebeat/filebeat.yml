@@ -1,0 +1,38 @@
+# =============================================================================
+# Filebeat — tails Traefik's JSON access log and ships each line to Logstash.
+#
+# Traefik writes one JSON document per request. We let Filebeat decode it
+# (decode_json_fields) so the document arrives at Logstash as structured
+# fields rather than an opaque "message" string. Logstash then promotes
+# selected fields and writes to the logs-traefik.access-default data stream.
+# =============================================================================
+
+filebeat.inputs:
+  - type: filestream
+    id: traefik-access
+    enabled: true
+    paths:
+      - /var/log/traefik/access.log
+    parsers:
+      - ndjson:
+          target: "traefik"
+          overwrite_keys: true
+          add_error_key: true
+    fields:
+      log_type: traefik-access
+    fields_under_root: true
+
+# We do not need filebeat's own modules or registry persistence for a demo,
+# but the registry path must be writable.
+filebeat.registry.path: /usr/share/filebeat/data/registry
+
+# Ship everything to the Logstash Beats input dedicated to Traefik logs.
+output.logstash:
+  hosts: ["logstash:5045"]
+
+# Disable the http monitoring endpoint to keep the container minimal.
+http.enabled: false
+
+logging.level: info
+logging.to_stderr: true
+logging.metrics.enabled: false

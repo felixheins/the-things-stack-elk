@@ -114,6 +114,8 @@ imports:
 
 - A data view `tts-events` over `logs-tts.events-*` (`@timestamp` as the
   time field).
+- A data view `traefik-access` over `logs-traefik.access-*` for the
+  bundled Traefik demo ([§8.5](#85-bundled-demo-traefik-access-logs-as-a-second-source)).
 - Five saved searches as starting points for your own dashboards —
   _Gateway link health_, _Joins_, _Drops_, _Auth and audit_, and
   _Application uplinks_. They map to the patterns in [§7](#7-what-you-can-do-in-kibana).
@@ -387,7 +389,7 @@ All variables live in `.env` (copy from `.env.example`).
 ├── LICENSE                            # Apache-2.0
 ├── .env.example                       # configuration template
 ├── .gitignore
-├── docker-compose.yml                 # ES + Kibana + Logstash + setup + forwarder
+├── docker-compose.yml                 # ES + Kibana + Logstash + setup + forwarder + Traefik demo
 ├── docs/
 │   └── logging-events-to-elk.md       # standalone, self-contained article (no clone needed)
 ├── forwarder/
@@ -396,11 +398,18 @@ All variables live in `.env` (copy from `.env.example`).
 │   └── forwarder.py                   # async TTS → Logstash forwarder, with /healthz endpoint
 ├── logstash/
 │   ├── config/logstash.yml            # disables xpack monitoring, sets ECS v8
-│   └── pipeline/tts-events.conf       # parse name + identifiers, enrich, write to data stream
+│   ├── config/pipelines.yml           # declares the two pipelines below
+│   ├── pipeline/tts-events.conf       # parse name + identifiers, enrich, write to data stream
+│   └── pipeline/traefik-access.conf   # beats input → logs-traefik.access-* data stream
 ├── elasticsearch/
-│   └── setup.sh                       # one-shot ILM policy + component & index templates
-└── kibana/
-    └── saved-objects.ndjson           # importable data view + 5 saved searches
+│   └── setup.sh                       # one-shot ILM policies + component & index templates
+├── kibana/
+│   └── saved-objects.ndjson           # importable data view + 5 saved searches
+├── traefik/                           # §8.5 — Traefik access-log demo
+│   ├── traefik.yml                    # static config: JSON access logs on a shared volume
+│   └── dynamic.yml                    # one demo router → whoami backend
+└── filebeat/
+    └── filebeat.yml                   # tails Traefik's access.log, ships to Logstash :5045
 ```
 
 ---
@@ -594,6 +603,18 @@ Two ways:
   key has visibility rights (info / traffic-read / devices-read) but not
   the user-level _list ... the user is a collaborator of_ rights needed
   for discovery ([§1.4](#14-subscribing-without-list-rights)).
+
+### 8.5 Bundled demo: Traefik access logs as a second source
+
+A Traefik + filebeat side-pipeline ships HTTP access logs into a separate
+data stream `logs-traefik.access-default`, so the same Logstash → ES → Kibana
+spine carries a structurally unrelated source alongside TTS events.
+
+Generate traffic, then query in Kibana over `logs-traefik.access-*`:
+
+```bash
+for i in $(seq 1 20); do curl -s "http://localhost:8000/path-$i" >/dev/null; done
+```
 
 ---
 

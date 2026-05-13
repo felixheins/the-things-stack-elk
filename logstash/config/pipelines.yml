@@ -1,0 +1,13 @@
+# =============================================================================
+# Logstash pipelines.
+#
+# Two independent pipelines so the TTS event stream (TCP/json_lines from the
+# forwarder) and the Traefik access-log stream (Beats from filebeat) do not
+# share an input handler or filter chain.
+# =============================================================================
+
+- pipeline.id: tts-events
+  path.config: "/usr/share/logstash/pipeline/tts-events.conf"
+
+- pipeline.id: traefik-access
+  path.config: "/usr/share/logstash/pipeline/traefik-access.conf"
