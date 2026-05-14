@@ -1,0 +1,40 @@
+# =============================================================================
+# Traefik static configuration — lab demo. See README §X (Traefik access logs).
+#
+# Two key bits for the access-log demo:
+#   - `accesslog.format: json`         → one JSON document per request
+#   - `accesslog.filePath`             → writes to a shared volume that the
+#                                        filebeat sidecar tails
+# =============================================================================
+
+entryPoints:
+  web:
+    address: ":80"
+  traefik:
+    address: ":8080"
+
+api:
+  dashboard: true
+  insecure: true # dashboard on :8080, no auth — lab only
+
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 0 # flush each request synchronously (small demo, no perf concern)
+  fields:
+    defaultMode: keep
+    headers:
+      defaultMode: drop
+      names:
+        User-Agent: keep
+        Referer: keep
+        X-Forwarded-For: keep
+
+log:
+  level: INFO
+  format: json
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true

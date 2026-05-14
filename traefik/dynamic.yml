@@ -1,0 +1,14 @@
+# Dynamic routing — single demo router pointing every HTTP request at the
+# whoami backend so we generate access-log lines worth indexing.
+http:
+  routers:
+    whoami:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [web]
+      service: whoami
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: "http://whoami:80"

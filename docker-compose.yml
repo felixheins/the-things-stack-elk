@@ -7,7 +7,6 @@
 # =============================================================================
 
 services:
-
   # ---- Elasticsearch ------------------------------------------------------
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
@@ -30,9 +29,13 @@ services:
       - esdata:/usr/share/elasticsearch/data
     ports:
       - "${ELASTICSEARCH_PORT}:9200"
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -E '\"status\":\"(green|yellow)\"'"]
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -E ''"status":"(green|yellow)"''',
+        ]
       interval: 10s
       timeout: 5s
       retries: 60
@@ -49,8 +52,8 @@ services:
       - RETENTION_DAYS=${RETENTION_DAYS}
     volumes:
       - ./elasticsearch:/setup:ro
-    networks: [ elk ]
-    entrypoint: [ "/bin/bash", "/setup/setup.sh" ]
+    networks: [elk]
+    entrypoint: ["/bin/bash", "/setup/setup.sh"]
     restart: "no"
 
   # ---- Kibana --------------------------------------------------------------
@@ -71,14 +74,22 @@ services:
     mem_limit: ${KB_MEM_LIMIT}
     ports:
       - "${KIBANA_PORT}:5601"
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS http://localhost:5601/api/status | grep -q ''"level":"available"''',
+        ]
       interval: 15s
       timeout: 5s
       retries: 30
 
   # ---- Logstash ------------------------------------------------------------
+  #
+  # Two pipelines, configured via logstash/config/pipelines.yml:
+  #   1. tts-events     — TCP/json_lines from the forwarder on 5044
+  #   2. traefik-access — Beats from filebeat on 5045
   #
   # Output target defaults to the in-stack Elasticsearch but every field is
   # env-driven, so pointing at Elastic Cloud or a managed cluster is just a
@@ -99,8 +110,9 @@ services:
     mem_limit: ${LS_MEM_LIMIT}
     volumes:
       - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
       - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9600 >/dev/null"]
       interval: 15s
@@ -125,18 +137,80 @@ services:
       - LOGSTASH_PORT=5044
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
-    networks: [ elk ]
+    networks: [elk]
     healthcheck:
-      # File mtime check against a heartbeat the forwarder touches every 30s.
-      # `start_period` covers the first heartbeat write after container start.
-      test: ["CMD-SHELL", "test -f /tmp/forwarder-alive && [ $(($(date +%s) - $(stat -c %Y /tmp/forwarder-alive))) -lt 90 ]"]
+      # HTTP probe against the forwarder's /healthz endpoint. The image is
+      # `python:3.12-slim` (no curl), so we use stdlib urllib — it raises on
+      # any non-2xx response, which exits the python process non-zero.
+      # `start_period` covers boot + the first heartbeat tick.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
 
+  # ---- Traefik (demo source of access logs) --------------------------------
+  #
+  # Reverse proxy in front of the `whoami` backend below. Writes one JSON
+  # document per request to /var/log/traefik/access.log on the shared
+  # `traefik-logs` volume, which the filebeat sidecar tails.
+  traefik:
+    image: traefik:v3.1
+    container_name: tts-elk-traefik
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-8000}:80"
+      - "${TRAEFIK_DASHBOARD_PORT:-8081}:8080"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - traefiklogs:/var/log/traefik
+    networks: [elk]
+    restart: unless-stopped
+
+  # ---- whoami (demo backend behind Traefik) --------------------------------
+  #
+  # Tiny HTTP echo server so requests through Traefik produce real 200s
+  # (and 404s if you hit unrouted paths). Generates the access-log volume
+  # the demo needs.
+  whoami:
+    image: traefik/whoami:v1.10
+    container_name: tts-elk-whoami
+    networks: [elk]
+    restart: unless-stopped
+
+  # ---- Filebeat (Traefik access-log shipper) -------------------------------
+  #
+  # Tails the JSON access log from the shared volume and forwards each line
+  # to Logstash's Beats input on port 5045 (the `traefik-access` pipeline).
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:${STACK_VERSION}
+    container_name: tts-elk-filebeat
+    # filebeat refuses to start if the config file is group/world-writable.
+    # Run as root so it can also read the access log regardless of host umask.
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    depends_on:
+      logstash: { condition: service_healthy }
+      traefik: { condition: service_started }
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - traefiklogs:/var/log/traefik:ro
+      - filebeatdata:/usr/share/filebeat/data
+    networks: [elk]
+    restart: unless-stopped
+
 volumes:
   esdata:
+  traefiklogs:
+  filebeatdata:
 
 networks:
   elk:

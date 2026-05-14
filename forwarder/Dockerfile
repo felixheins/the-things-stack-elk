@@ -7,5 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY forwarder.py .
 
+EXPOSE 8080
+
 USER nobody
 ENTRYPOINT ["python", "-u", "forwarder.py"]

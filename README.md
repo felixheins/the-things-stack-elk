@@ -18,7 +18,7 @@ splits the dotted event name, promotes common entity IDs to top-level
 fields, and writes to a time-based Elasticsearch data stream governed by
 an ILM policy.
 
-> **Status:** demo / lab. See [§10 Going to production](#10-going-to-production) for what to harden before running it for real.
+> **Status:** starting recommendation, not a packaged product. Single-node, plain HTTP, shared credentials. Treat it as a reference for building your own deployment — see [§10](#10-beyond-the-demo) for what to think through before running it against real data.
 >
 > Looking for a self-contained article (no clone needed, all config inline)? See [`docs/logging-events-to-elk.md`](docs/logging-events-to-elk.md).
 
@@ -35,7 +35,7 @@ an ILM policy.
 7. [What you can do in Kibana](#7-what-you-can-do-in-kibana)
 8. [Common adaptations](#8-common-adaptations)
 9. [Troubleshooting](#9-troubleshooting)
-10. [Going to production](#10-going-to-production)
+10. [Beyond the demo](#10-beyond-the-demo)
 11. [Appendix: useful event names](#11-appendix-useful-event-names)
 
 ---
@@ -48,22 +48,27 @@ on-prem, or Open Source. You provide a hostname and an API key.
 ### 1.1 Create an API key
 
 1. In the TTS Console of your deployment, open
-   `https://<your-tts-host>/console/user-api-keys/add`. (For TTS Cloud
+   `https://<your-tts-host>/console/user-settings/api-keys`. (For TTS Cloud
    that's typically `<tenant>.eu1.cloud.thethings.industries` for the
    EU1 cluster, `nam1.cloud.thethings.industries` for North America, etc.)
 2. Name it `tts-elk-forwarder`.
 3. Pick the rights you need. There are two families — see [§3](#3-api-key-permissions) for the full table:
-   - **List rights** (`RIGHT_USER_APPLICATIONS_LIST`, `RIGHT_USER_GATEWAYS_LIST`,
-     `RIGHT_USER_ORGANIZATIONS_LIST`, `RIGHT_USER_CLIENTS_LIST`) let the
-     forwarder *discover* entities to subscribe to.
-   - **Info / traffic-read rights** (`RIGHT_APPLICATION_INFO`,
-     `RIGHT_APPLICATION_TRAFFIC_READ`, `RIGHT_GATEWAY_INFO`,
-     `RIGHT_GATEWAY_TRAFFIC_READ`, `RIGHT_ORGANIZATION_INFO`) gate which
-     events the API actually emits over the stream.
-   You need **both** for full auto-discovery. If your key only has the
-   info/traffic rights (which is common), the forwarder still works —
-   set `STATIC_IDENTIFIERS` in `.env` (see §1.4) to subscribe to a
-   hard-coded list.
+   - **Discovery rights** — _list applications the user is a collaborator
+     of_, _list gateways the user is a collaborator of_, _list
+     organizations the user is a member of_, _list OAuth clients the
+     user is a collaborator of_, plus _view devices in application_
+     (per application, for end-device listing) — let the forwarder
+     _discover_ entities to subscribe to.
+   - **Visibility rights** — _view application information_, _read
+     application traffic (uplink and downlink)_, _view devices in
+     application_, _view gateway information_, _read gateway traffic_,
+     _view gateway status_, _view organization information_, _view user
+     information_, _view OAuth client information_ — gate which events
+     the API actually emits over the stream.
+     You need **both** for full auto-discovery. If your key only has the
+     visibility rights (which is common), the forwarder still works —
+     set `STATIC_IDENTIFIERS` in `.env` (see [§1.4](#14-subscribing-without-list-rights)) to subscribe to a
+     hard-coded list.
 4. Save and **copy the key now** — TTS shows it only once.
 
 ### 1.2 Configure and start
@@ -84,7 +89,7 @@ sed -i.bak "s|^KIBANA_ENCRYPTION_KEY=.*|KIBANA_ENCRYPTION_KEY=$(openssl rand -he
 docker compose up -d --build
 ```
 
-The first `docker compose up` does a lot:
+The first `docker compose up` does the following:
 
 1. Pulls Elasticsearch 8.13, Kibana, and Logstash images.
 2. Builds the forwarder image (Python 3.12 + httpx).
@@ -99,7 +104,7 @@ The first `docker compose up` does a lot:
 Once everything is healthy:
 
 - Kibana → <http://localhost:5601> (log in as `elastic` with the password from `.env`).
-- Elasticsearch → <http://localhost:9200> (same credentials).
+- Elasticsearch → <http://localhost:9200> (log in as `kibana_system` with the password from `.env`).
 
 ### 1.3 Import the Kibana saved objects
 
@@ -109,9 +114,11 @@ imports:
 
 - A data view `tts-events` over `logs-tts.events-*` (`@timestamp` as the
   time field).
+- A data view `traefik-access` over `logs-traefik.access-*` for the
+  bundled Traefik demo ([§8.5](#85-bundled-demo-traefik-access-logs-as-a-second-source)).
 - Five saved searches as starting points for your own dashboards —
-  *Gateway link health*, *Joins*, *Drops*, *Auth and audit*, and
-  *Application uplinks*. They map to the patterns in §7.
+  _Gateway link health_, _Joins_, _Drops_, _Auth and audit_, and
+  _Application uplinks_. They map to the patterns in [§7](#7-what-you-can-do-in-kibana).
 
 Then open **Discover** → choose `tts-events` (or any of the saved
 searches). Within ~30 seconds of any device traffic, gateway connect, or
@@ -132,7 +139,7 @@ SUBSCRIBE_KINDS=gateways
 The forwarder will skip discovery entirely and subscribe to exactly that
 identifier set. You can mix kinds:
 
-```
+```bash
 STATIC_IDENTIFIERS={"gateways":[{"gateway_id":"my-gw"}],"applications":[{"application_id":"my-app"}]}
 SUBSCRIBE_KINDS=gateways,applications
 ```
@@ -140,7 +147,7 @@ SUBSCRIBE_KINDS=gateways,applications
 For end devices use the `EndDeviceIdentifiers` shape (device id plus the
 parent application):
 
-```
+```bash
 STATIC_IDENTIFIERS={"end_devices":[{"device_id":"my-dev","application_ids":{"application_id":"my-app"}}]}
 SUBSCRIBE_KINDS=end_devices
 ```
@@ -162,9 +169,7 @@ request body shape:
 
 ```json
 {
-  "identifiers": [
-    { "application_ids": { "application_id": "my-app" } }
-  ],
+  "identifiers": [{ "application_ids": { "application_id": "my-app" } }],
   "tail": 0,
   "names": ["/.+/"]
 }
@@ -182,9 +187,9 @@ Important constraints we design around:
   framing for forward-compatibility.
 - **Visibility-scoped.** The API only emits events whose
   `visibility.rights` set is fully covered by the rights of your API key.
-  To see everything, the key needs the rights listed in §3.
+  To see everything, the key needs the rights listed in [§3](#3-api-key-permissions).
 - **Hierarchical identifier matching.** A subscription on `application_ids`
-  also delivers events scoped to the application's *devices* — TTS treats
+  also delivers events scoped to the application's _devices_ — TTS treats
   end-device events as covered by their parent application. The forwarder
   therefore captures device traffic via the `applications` subscription
   even without a separate device-level subscription. It still subscribes
@@ -196,14 +201,36 @@ Important constraints we design around:
   for splitting a high-volume deployment across multiple forwarders, e.g.
   one for `^(ns|gs)\..+` and one for `^as\..+`.
 
-### 2.2 What an event looks like
+### 2.2 Load on TTS
+
+The forwarder uses two distinct call patterns against the Events API,
+and that's it — there's no general polling loop:
+
+- **Persistent event streams.** One long-lived `POST /api/v3/events`
+  per kind in `SUBSCRIBE_KINDS` (up to six by default — applications,
+  gateways, organizations, users, clients, end-devices). Events arrive
+  pushed; the connection stays open with no read timeout. Reconnects
+  back off exponentially up to 60 s on failure.
+- **Periodic entity re-discovery, every `REFRESH_INTERVAL` seconds**
+  (default `300` = 5 min). At each tick the forwarder paginates
+  `GET /<kind>` per kind, then closes and reopens the corresponding
+  stream so newly-created entities start being captured. End-device
+  discovery also walks `GET /applications/{id}/devices` per
+  application, so its cost scales with the application count.
+
+`STATIC_IDENTIFIERS` skips re-discovery entirely — only the persistent
+streams remain. On tenants with thousands of entities, raise
+`REFRESH_INTERVAL` (e.g. to `1800`) if you see `429 Too Many Requests`,
+or drop kinds you don't need from `SUBSCRIBE_KINDS`.
+
+### 2.3 What an event looks like
 
 The fields below are the [`Event`](https://www.thethingsindustries.com/docs/api/reference/grpc/events/)
 message; everything except `data` is consistent across event types.
 
 ```jsonc
 {
-  "name": "as.up.forward",                  // dotted hierarchy: component.category.action
+  "name": "as.up.data.forward",             // dotted hierarchy — component, category, …, action
   "time": "2026-04-30T11:23:45.123Z",       // canonical event time
   "identifiers": [ { "device_ids": { … } } ],
   "data": { "@type": "type.googleapis.com/ttn.lorawan.v3.ApplicationUp", … },
@@ -221,14 +248,14 @@ message; everything except `data` is consistent across event types.
 After the Logstash filters in [`logstash/pipeline/tts-events.conf`](logstash/pipeline/tts-events.conf)
 each document also gains:
 
-| Field | Meaning |
-|---|---|
-| `event_component`, `event_category`, `event_action` | Parts of `name` (e.g. `as`, `up`, `forward`). |
-| `application_id`, `gateway_id`, `device_id`, `dev_eui`, `join_eui`, `organization_id`, `user_id`, `client_id` | Promoted out of `identifiers` for cheap aggregations. |
-| `_subscription_kind` | Which forwarder subscription delivered it (`applications` / `gateways` / …). |
-| `@timestamp` | Set from the TTS `time` field, not Logstash's wall clock. |
+| Field                                                                                                         | Meaning                                                                      |
+| ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `event_component`, `event_category`, `event_action`                                                           | Parts of `name` (e.g. `as`, `up`, `forward`).                                |
+| `application_id`, `gateway_id`, `device_id`, `dev_eui`, `join_eui`, `organization_id`, `user_id`, `client_id` | Promoted out of `identifiers` for cheap aggregations.                        |
+| `_subscription_kind`                                                                                          | Which forwarder subscription delivered it (`applications` / `gateways` / …). |
+| `@timestamp`                                                                                                  | Set from the TTS `time` field, not Logstash's wall clock.                    |
 
-### 2.3 Indexing and retention
+### 2.4 Indexing and retention
 
 Documents land in the data stream **`logs-tts.events-default`**. The ILM
 policy `tts-events-ilm` (installed by the setup container) rolls over
@@ -242,42 +269,87 @@ recent event produces an idempotent overwrite, not a duplicate.
 
 ## 3. API key permissions
 
-Two distinct families of rights are involved:
+Two distinct families of rights are involved. The names below are the
+human-readable labels shown in the TTS Console when creating an API
+key.
 
-**A. List rights** — needed to discover entities to subscribe to:
+**A. Discovery rights** — needed to discover entities to subscribe to:
 
-| Right                            | Allows                                     |
-|----------------------------------|--------------------------------------------|
-| `RIGHT_USER_APPLICATIONS_LIST`   | `GET /applications`                        |
-| `RIGHT_USER_GATEWAYS_LIST`       | `GET /gateways`                            |
-| `RIGHT_USER_ORGANIZATIONS_LIST`  | `GET /organizations`                       |
-| `RIGHT_USER_CLIENTS_LIST`        | `GET /clients`                             |
+| Right                                                | Allows                                |
+| ---------------------------------------------------- | ------------------------------------- |
+| _list applications the user is a collaborator of_   | `GET /applications`                   |
+| _list gateways the user is a collaborator of_       | `GET /gateways`                       |
+| _list organizations the user is a member of_        | `GET /organizations`                  |
+| _list OAuth clients the user is a collaborator of_  | `GET /clients`                        |
+| _view devices in application_ (per application)     | `GET /applications/{id}/devices`      |
 
-**B. Info / traffic-read rights** — gate which events you actually receive:
+The first four are user-level (or organization-level for an
+organization API key). _view devices in application_ is per-application,
+and is only required if `end_devices` is in `SUBSCRIBE_KINDS` and you
+rely on auto-discovery rather than `STATIC_IDENTIFIERS`.
 
-| Right                            | Provides visibility for                          |
-|----------------------------------|--------------------------------------------------|
-| `RIGHT_APPLICATION_INFO`         | Application lifecycle events                     |
-| `RIGHT_APPLICATION_TRAFFIC_READ` | AS up/down forward, NS uplink, joins             |
-| `RIGHT_GATEWAY_INFO`             | Gateway lifecycle events                         |
-| `RIGHT_GATEWAY_TRAFFIC_READ`     | GS connect/disconnect, up/down, status           |
-| `RIGHT_GATEWAY_STATUS_READ`      | Gateway status / connection-stats events         |
-| `RIGHT_ORGANIZATION_INFO`        | Org lifecycle events                             |
-| `RIGHT_USER_INFO`                | User auth/login events                           |
-| `RIGHT_CLIENT_INFO`              | OAuth-client events                              |
+`SUBSCRIBE_KINDS` also includes `users` by default. Listing user
+accounts (`GET /users`) requires _list user accounts_, which the
+identity server gates behind admin status — selecting it on a normal
+API key has no effect. On non-admin keys, drop `users` from
+`SUBSCRIBE_KINDS` (otherwise the forwarder logs a WARNING per refresh
+interval and skips the kind).
 
-**For full auto-discovery you need rights from both families.** Note in
-particular: having `RIGHT_APPLICATION_INFO` alone does *not* let you
-list applications — that requires the user-level `RIGHT_USER_APPLICATIONS_LIST`.
+**B. Visibility rights** — gate which events the stream actually emits:
+
+| Right                                                | Provides visibility for                  |
+| ---------------------------------------------------- | ---------------------------------------- |
+| _view application information_                       | Application lifecycle events             |
+| _read application traffic (uplink and downlink)_     | AS up/down forward, NS uplink, joins     |
+| _view devices in application_                        | Device CRUD; some uplink/join events     |
+| _view gateway information_                           | Gateway lifecycle events                 |
+| _read gateway traffic_                               | GS connect/disconnect, up/down           |
+| _view gateway status_                                | Gateway status / connection-stats events |
+| _view organization information_                      | Org lifecycle events                     |
+| _view user information_                              | User auth / login events                 |
+| _view OAuth client information_                      | OAuth-client lifecycle events            |
+
+The following are optional — they only add visibility for events
+about the corresponding settings change (which the forwarder will
+otherwise silently miss):
+
+- _edit basic application settings_, _view and edit application API keys_,
+  _view and edit application collaborators_, _view and edit application
+  packages and associations_
+- _edit basic gateway settings_, _view and edit gateway API keys_,
+  _view and edit gateway collaborators_, _view gateway location_
+- _edit basic organization settings_, _view and edit organization API
+  keys_, _view and edit organization members_
+- _edit OAuth client basic settings_, _view and edit OAuth client
+  collaborators_
+- _view and edit user API keys_, _view and edit authorized OAuth
+  clients of the user_
+
+The TTS Console labels the settings rights with "edit", but they are
+read+write — TTS does not split read and write for those. There is no
+way to get the change events without granting them.
+
+**For full auto-discovery you need rights from both families.** Note
+in particular: having _view application information_ alone does _not_
+let you list applications — that requires the user-level _list
+applications the user is a collaborator of_.
 
 If your API key only has rights from family B (which is common — e.g.
 collaborator keys scoped to specific applications), use the
 `STATIC_IDENTIFIERS` env var ([§1.4](#14-subscribing-without-list-rights))
 to skip discovery and supply the entity list directly.
 
-For tenant-wide visibility, an **admin user** still needs the LIST rights
-explicitly granted to the API key — `is_admin: true` does not bypass per-key
-right checks.
+For tenant-wide visibility, an **admin user** still needs the discovery
+rights explicitly granted to the API key — `is_admin: true` does not
+bypass per-key right checks. The exception is _list user accounts_,
+which is admin-gated regardless.
+
+What to deliberately leave **out**: any right with _delete_, _purge_,
+_create_, _write_, or _link_ in its label — the forwarder is read-only.
+Also _view device keys in application_ and _retrieve secrets associated
+with a gateway_: no event declares these as visibility rights, and
+granting them only exposes secrets in listing responses, which you
+don't want flowing into ELK.
 
 ---
 
@@ -285,27 +357,27 @@ right checks.
 
 All variables live in `.env` (copy from `.env.example`).
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `TTS_HOST` | (placeholder — must change) | TTS hostname (no scheme). e.g. `<tenant>.eu1.cloud.thethings.industries` for TTS Cloud, or your own host for self-hosted. |
-| `TTS_API_KEY` | — | Required. Bearer token created in §1.1. |
-| `TTS_INSECURE` | `false` | Set `true` only for self-signed dev TTS. |
-| `SUBSCRIBE_KINDS` | `applications,gateways,organizations,users,clients,end_devices` | Identifier kinds to subscribe to. |
-| `EVENT_NAMES_REGEX` | `/.+/` | Filter on event names (TTS regex syntax). |
-| `REFRESH_INTERVAL` | `300` | Seconds between entity re-list + stream reopen. |
-| `STATIC_IDENTIFIERS` | (empty) | JSON object overriding entity discovery. See §1.4. |
-| `LOG_LEVEL` | `INFO` | Forwarder log level (`DEBUG` logs every event name). |
-| `STACK_VERSION` | `8.13.4` | ES / Kibana / Logstash image tag. |
-| `ELASTIC_PASSWORD` | `change-me-elastic` | `elastic` superuser password. |
-| `KIBANA_PASSWORD` | `change-me-kibana` | `kibana_system` service account password. |
-| `KIBANA_ENCRYPTION_KEY` | — | Required. ≥32-char random; `openssl rand -hex 32`. |
-| `ES_JAVA_OPTS`, `LS_JAVA_OPTS` | `-Xms2g -Xmx2g`, `-Xms512m -Xmx512m` | JVM heap. |
-| `ES_MEM_LIMIT`, `KB_MEM_LIMIT`, `LS_MEM_LIMIT` | `4g`, `1g`, `1g` | Container memory caps. |
-| `KIBANA_PORT`, `ELASTICSEARCH_PORT` | `5601`, `9200` | Host port mappings. |
-| `RETENTION_DAYS` | `90` | ILM delete-phase age. |
-| `ES_HOSTS` | `http://elasticsearch:9200` | Logstash → ES endpoint. Override to target Elastic Cloud / external ES (§8.1). |
-| `ES_USER`, `ES_PASSWORD` | `elastic`, `${ELASTIC_PASSWORD}` | Logstash → ES credentials. |
-| `DATA_STREAM_NAMESPACE` | `default` | ES data-stream namespace; set per tenant for multi-tenant ingest (§8.2). |
+| Variable                                       | Required | Default                                                         | Purpose                                                                                                                   |
+| ---------------------------------------------- | -------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `TTS_HOST`                                     | Required | —                                                               | TTS hostname (no scheme). e.g. `<tenant>.eu1.cloud.thethings.industries` for TTS Cloud, or your own host for self-hosted. |
+| `TTS_API_KEY`                                  | Required | —                                                               | Bearer token created in [§1.1](#11-create-an-api-key).                                                                    |
+| `TTS_INSECURE`                                 | Optional | `false`                                                         | Set `true` only for self-signed dev TTS.                                                                                  |
+| `SUBSCRIBE_KINDS`                              | Optional | `applications,gateways,organizations,users,clients,end_devices` | Identifier kinds to subscribe to.                                                                                         |
+| `EVENT_NAMES_REGEX`                            | Optional | `/.+/`                                                          | Filter on event names (TTS regex syntax).                                                                                 |
+| `REFRESH_INTERVAL`                             | Optional | `300`                                                           | Seconds between entity re-list + stream reopen.                                                                           |
+| `STATIC_IDENTIFIERS`                           | Optional | (empty)                                                         | JSON object overriding entity discovery. See [§1.4](#14-subscribing-without-list-rights).                                 |
+| `LOG_LEVEL`                                    | Optional | `INFO`                                                          | Forwarder log level (`DEBUG` logs every event name).                                                                      |
+| `STACK_VERSION`                                | Required | `8.13.4`                                                        | ES / Kibana / Logstash image tag.                                                                                         |
+| `ELASTIC_PASSWORD`                             | Required | `change-me-elastic`                                             | `elastic` superuser password.                                                                                             |
+| `KIBANA_PASSWORD`                              | Required | `change-me-kibana`                                              | `kibana_system` service account password.                                                                                 |
+| `KIBANA_ENCRYPTION_KEY`                        | Required | —                                                               | ≥32-char random; `openssl rand -hex 32`.                                                                                  |
+| `ES_JAVA_OPTS`, `LS_JAVA_OPTS`                 | Required | `-Xms2g -Xmx2g`, `-Xms512m -Xmx512m`                            | JVM heap.                                                                                                                 |
+| `ES_MEM_LIMIT`, `KB_MEM_LIMIT`, `LS_MEM_LIMIT` | Required | `4g`, `1g`, `1g`                                                | Container memory caps.                                                                                                    |
+| `KIBANA_PORT`, `ELASTICSEARCH_PORT`            | Required | `5601`, `9200`                                                  | Host port mappings.                                                                                                       |
+| `RETENTION_DAYS`                               | Required | `90`                                                            | ILM delete-phase age.                                                                                                     |
+| `ES_HOSTS`                                     | Optional | `http://elasticsearch:9200`                                     | Logstash → ES endpoint. Override to target an external / managed cluster ([§8.1](#81-pointing-at-an-external-or-managed-elasticsearch)). |
+| `ES_USER`, `ES_PASSWORD`                       | Optional | `elastic`, `${ELASTIC_PASSWORD}`                                | Logstash → ES credentials.                                                                                                |
+| `DATA_STREAM_NAMESPACE`                        | Optional | `default`                                                       | ES data-stream namespace; set per tenant for multi-tenant ingest ([§8.2](#82-multi-tenant-ingest-one-cluster-many-tts-deployments)). |
 
 ---
 
@@ -313,21 +385,31 @@ All variables live in `.env` (copy from `.env.example`).
 
 ```
 .
-├── README.md                       # this file
-├── LICENSE                         # Apache-2.0
-├── .env.example                    # configuration template
-├── docker-compose.yml              # ES + Kibana + Logstash + setup + forwarder
+├── README.md                          # this file
+├── LICENSE                            # Apache-2.0
+├── .env.example                       # configuration template
+├── .gitignore
+├── docker-compose.yml                 # ES + Kibana + Logstash + setup + forwarder + Traefik demo
+├── docs/
+│   └── logging-events-to-elk.md       # standalone, self-contained article (no clone needed)
 ├── forwarder/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── forwarder.py                # async TTS → Logstash forwarder
+│   ├── Dockerfile                     # python:3.12-slim base
+│   ├── requirements.txt               # httpx
+│   └── forwarder.py                   # async TTS → Logstash forwarder, with /healthz endpoint
 ├── logstash/
-│   ├── config/logstash.yml
-│   └── pipeline/tts-events.conf    # parse + enrich + ES output
+│   ├── config/logstash.yml            # disables xpack monitoring, sets ECS v8
+│   ├── config/pipelines.yml           # declares the two pipelines below
+│   ├── pipeline/tts-events.conf       # parse name + identifiers, enrich, write to data stream
+│   └── pipeline/traefik-access.conf   # beats input → logs-traefik.access-* data stream
 ├── elasticsearch/
-│   └── setup.sh                    # one-shot ILM + templates installer
-└── kibana/
-    └── saved-objects.ndjson        # importable data view + saved searches
+│   └── setup.sh                       # one-shot ILM policies + component & index templates
+├── kibana/
+│   └── saved-objects.ndjson           # importable data view + 5 saved searches
+├── traefik/                           # §8.5 — Traefik access-log demo
+│   ├── traefik.yml                    # static config: JSON access logs on a shared volume
+│   └── dynamic.yml                    # one demo router → whoami backend
+└── filebeat/
+    └── filebeat.yml                   # tails Traefik's access.log, ships to Logstash :5045
 ```
 
 ---
@@ -360,40 +442,54 @@ ttn-lw-cli --config tts.yml end-devices get my-app my-device  # any read shows u
 ```
 
 Otherwise, just clicking around the TTS Console (which goes through the
-same APIs) generates plenty of `is.*` events.
+same APIs) generates plenty of identity-server events
+(`application.*`, `gateway.*`, `user.*`, `oauth.*`).
 
 ---
 
 ## 7. What you can do in Kibana
 
-The saved-objects import in §1.3 ships five Discover searches that line
+The saved-objects import in [§1.3](#13-import-the-kibana-saved-objects) ships five Discover searches that line
 up with the most common questions:
 
-| Saved search | Filter |
-|---|---|
-| TTS — Gateway link health | `event_component : "gs" and event_action : (connect or disconnect)` |
-| TTS — Joins | `event_category : "join"` (use `event_action` to split accept vs reject) |
-| TTS — Drops | `event_action : "drop"` (uplinks, downlinks, application messages) |
-| TTS — Auth and audit | `event_component : "is" and event_category : (oauth or user)` |
-| TTS — Application uplinks | `name : "as.up.forward"` |
+| Saved search              | Filter                                                                                          |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| TTS — Gateway link health | `event_component : "gs" and event_action : (connect or disconnect)`                             |
+| TTS — Joins               | `name : *join*` (KQL wildcard — covers `js.join.*`, `as.up.join.*`, `ns.up.join.*`, `ns.down.join.*`) |
+| TTS — Drops               | `event_action : "drop"` (matches every `*.drop` event — uplinks, downlinks, app messages, …)    |
+| TTS — Auth and audit      | `name : (oauth.* or account.* or user.* or invitation.* or *.api-key.* or *.collaborator.*)`    |
+| TTS — Application uplinks | `name : "as.up.data.forward"`                                                                   |
+
+How the parsed-name fields work: the Logstash filter splits `name` on
+dots and exposes the **first** segment as `event_component`, the
+**second** as `event_category`, and the **last** as `event_action`. So
+`as.up.data.forward` becomes `as` / `up` / `forward`, and
+`gs.down.schedule.fail` becomes `gs` / `down` / `fail`. Two-segment
+names like `application.create` set component + category + action all
+to non-empty values (component=`application`, category=`create`,
+action=`create`).
 
 These are intentionally just queries with column presets — extend them or
 build Lens visualisations on top. A typical first dashboard pulls in:
 
-| Panel | Definition |
-|---|---|
-| Event volume | Date histogram, breakdown by `event_component.keyword`. |
-| Top noisy devices | Terms on `device_id.keyword`, size 20. |
-| Gateway flap timeline | The *Gateway link health* saved search above. |
-| Failed downlinks | Filter `event_category : "down" and event_action : "fail"`. |
-| Auth events | The *Auth and audit* saved search above. |
+| Panel                 | Definition                                                  |
+| --------------------- | ----------------------------------------------------------- |
+| Event volume          | Date histogram, breakdown by `event_component`.             |
+| Top noisy devices     | Terms on `device_id`, size 20.                              |
+| Gateway flap timeline | The _Gateway link health_ saved search above.               |
+| Failed downlinks      | Filter `event_category : "down" and event_action : "fail"`. |
+| Auth events           | The _Auth and audit_ saved search above.                    |
+
+(The pre-mapped `keyword` fields in [`elasticsearch/setup.sh`](elasticsearch/setup.sh)
+do **not** have a `.keyword` subfield — use the field name directly in
+Lens / TSVB.)
 
 ### 7.1 An example alert rule — ingest lag
 
 The single highest-signal alarm is "no events have been indexed in the
 last few minutes": it catches forwarder hangs, TTS API outages, and
 Logstash backpressure with one rule. Create it in Kibana
-**Stack Management → Rules** as an *Elasticsearch query* rule, or via
+**Stack Management → Rules** as an _Elasticsearch query_ rule, or via
 the Alerting API:
 
 ```bash
@@ -438,7 +534,7 @@ deployment will tweak it. The variants below show the smallest diff for
 the cases that come up most often. Each one is independent; combine as
 needed.
 
-### 8.1 Pointing at Elastic Cloud or an external Elasticsearch
+### 8.1 Pointing at an external or managed Elasticsearch
 
 The Logstash output is fully env-driven, so targeting a managed cluster
 needs no code change. In `.env`:
@@ -480,13 +576,13 @@ who sees which tenant's data. A cross-tenant admin space backed by
 
 ### 8.3 Trimming high-volume payloads
 
-Most bytes in `as.up.forward` events are in the decoded/raw payload.
+Most bytes in `as.up.data.forward` events are in the decoded/raw payload.
 If your application database already has these — which is usually the
 case — drop them in the Logstash filter:
 
 ```ruby
 # Add to logstash/pipeline/tts-events.conf, inside filter { … }
-if [name] == "as.up.forward" {
+if [name] == "as.up.data.forward" {
   mutate {
     remove_field => ["[data][frm_payload]", "[data][decoded_payload]"]
   }
@@ -504,196 +600,152 @@ Two ways:
   `STATIC_IDENTIFIERS` empty, set `SUBSCRIBE_KINDS=applications`. The
   forwarder will discover exactly the entities the key can see.
 - **Via STATIC_IDENTIFIERS.** Hard-code the targets — useful when the
-  key has `*_INFO` / `*_TRAFFIC_READ` rights but not the user-level
-  `*_LIST` rights needed for discovery (§1.4).
+  key has visibility rights (info / traffic-read / devices-read) but not
+  the user-level _list ... the user is a collaborator of_ rights needed
+  for discovery ([§1.4](#14-subscribing-without-list-rights)).
+
+### 8.5 Bundled demo: Traefik access logs as a second source
+
+A Traefik + filebeat side-pipeline ships HTTP access logs into a separate
+data stream `logs-traefik.access-default`, so the same Logstash → ES → Kibana
+spine carries a structurally unrelated source alongside TTS events.
+
+Generate traffic, then query in Kibana over `logs-traefik.access-*`:
+
+```bash
+for i in $(seq 1 20); do curl -s "http://localhost:8000/path-$i" >/dev/null; done
+```
 
 ---
 
 ## 9. Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Forwarder logs `403` from `/applications` etc. | API key lacks the user-level `RIGHT_USER_*_LIST` rights | Either add those rights, or set `STATIC_IDENTIFIERS` (§1.4) to skip discovery. |
-| Forwarder logs `no <kind> visible to api key — sleeping` | Same as above, or genuinely no entities | If the API does grant the rights but you legitimately have no entities of that kind, drop them from `SUBSCRIBE_KINDS`. |
-| Events flow but `@timestamp` is "now" | Date filter not matching | Check `time` is present in incoming events: `docker compose logs logstash`. |
-| Mapping explosion warnings | Open-ended fields in `data` differing per event name | Already mitigated for `context` / `visibility`. If you have very high cardinality on a specific event's `data`, drop or flatten it in `tts-events.conf`. |
-| Duplicate events after a forwarder restart | `unique_id` missing | Make sure the forwarder hasn't been modified to strip the field. |
-| `429 Too Many Requests` | Aggressive `REFRESH_INTERVAL` against a tenant with thousands of entities | Increase `REFRESH_INTERVAL` to 1800. |
-| Forwarder loops `connection reset by peer` | Idle TCP timeout on a load balancer between forwarder and TTS | Front the deployment with a proxy that holds long-lived streams. TTS Cloud supports this natively. |
-| `setup` container exits non-zero on first run | ES not yet reachable, or wrong password in `.env` | `docker compose logs setup`; rerun `docker compose up -d` once the typo is fixed. |
-| `docker compose ps` shows `forwarder` as `unhealthy` | The heartbeat file (`/tmp/forwarder-alive`) is older than 90 s. Either the process is wedged or the container is starting up. | Check `docker compose logs forwarder`. The healthcheck has `start_period: 60s` so the first ~minute after `up` is allowed to be unhealthy. |
+| Symptom                                                  | Likely cause                                                                                                                  | Fix                                                                                                                                                      |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Forwarder logs `api key invalid or expired (401 …)` (ERROR) | API key revoked, deleted, or never accepted by TTS                                                                          | Mint a new key ([§1.1](#11-create-an-api-key)), update `TTS_API_KEY` in `.env`, `docker compose up -d --build forwarder`. Note the forwarder retries forever — it does **not** fail-fast on 401. |
+| Forwarder logs `api key has no rights to list <kind> — skipping` (WARNING) | API key lacks the user-level _list ... the user is a collaborator of_ right for that kind (see [§3](#3-api-key-permissions))  | Either add the right, or drop the kind from `SUBSCRIBE_KINDS`, or set `STATIC_IDENTIFIERS` ([§1.4](#14-subscribing-without-list-rights)) to skip discovery. |
+| Forwarder logs `no <kind> visible to api key — sleeping` | Key has the list right but no entities of that kind exist (or are visible to it)                                              | Drop the kind from `SUBSCRIBE_KINDS` if you legitimately have none.                                                                                      |
+| Events flow but `@timestamp` is "now"                    | Date filter not matching                                                                                                      | Check `time` is present in incoming events: `docker compose logs logstash`.                                                                              |
+| Mapping explosion warnings                               | Open-ended fields in `data` differing per event name                                                                          | Already mitigated for `context` / `visibility`. If you have very high cardinality on a specific event's `data`, drop or flatten it in `tts-events.conf`. |
+| Duplicate events after a forwarder restart               | `unique_id` missing                                                                                                           | Make sure the forwarder hasn't been modified to strip the field.                                                                                         |
+| `429 Too Many Requests`                                  | Aggressive `REFRESH_INTERVAL` against a tenant with thousands of entities                                                     | Increase `REFRESH_INTERVAL` to 1800.                                                                                                                     |
+| Forwarder loops `connection reset by peer`               | Idle TCP timeout on a load balancer between forwarder and TTS                                                                 | Front the deployment with a proxy that holds long-lived streams. TTS Cloud supports this natively.                                                       |
+| `setup` container exits non-zero on first run            | ES not yet reachable, or wrong password in `.env`                                                                             | `docker compose logs setup`; rerun `docker compose up -d` once the typo is fixed.                                                                        |
+| `docker compose ps` shows `forwarder` as `unhealthy`     | The forwarder's `/healthz` endpoint is unreachable or its in-memory heartbeat is older than 90 s. Either the process is wedged or the container is starting up. | Check `docker compose logs forwarder`. The healthcheck has `start_period: 60s` so the first ~minute after `up` is allowed to be unhealthy. Probe by hand with `docker compose exec forwarder python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/healthz').read())"`. |
 
 ---
 
-## 10. Going to production
+## 10. Beyond the demo
 
-Everything in this repo is tuned for a fast first-run on a laptop. None
-of it is wrong for production, but several explicit shortcuts need to be
-undone before you run this against a real deployment with real data and
-real users. The checklist below is grouped by concern.
+This repo is a **starting recommendation**, not a packaged product.
+It runs single-node, over plain HTTP, with shared credentials, with
+no buffer between the forwarder and the indexer. Every one of those
+choices is fine for a laptop and wrong for production. Before running
+it against real data, work through the checklist below — the specifics
+depend on your environment, so treat each item as a question to answer
+rather than a recipe to copy.
 
-### 10.1 Security
+**Security**
 
-| Concern | What's wrong in the demo | What to do |
-|---|---|---|
-| **In-cluster TLS** | ES↔Kibana, ES↔Logstash, ES↔setup all run over plain HTTP. | Generate a CA + per-node certs (`bin/elasticsearch-certutil ca` then `cert`), mount them, set `xpack.security.http.ssl.enabled=true`, and switch `http://elasticsearch:9200` → `https://…` everywhere (compose env, Logstash output, setup script). The cert layout is documented in the official [Elastic Docker docs](https://www.elastic.co/guide/en/elasticsearch/reference/current/docker.html). |
-| **Edge TLS for Kibana** | Kibana exposes plain HTTP on `localhost:5601`. | Front it with an SSO-aware reverse proxy (Caddy / Traefik / nginx + oauth2-proxy / Cloudflare Access) terminating TLS and enforcing OIDC. Don't bind 5601 publicly. |
-| **Least-privilege ES users** | Logstash and the setup container both authenticate as `elastic` (superuser). | Create dedicated roles via the [Security API](https://www.elastic.co/guide/en/elasticsearch/reference/current/security-api-put-role.html): a `tts-events-writer` role with `create_doc`/`auto_configure` on `logs-tts.events-*` for Logstash, and a `tts-events-reader` for Kibana viewers. Only the setup script needs admin rights. |
-| **Secrets management** | `TTS_API_KEY` and `ELASTIC_PASSWORD` live in `.env`, mounted as plain env vars. | Inject from a secrets store (Vault, AWS Secrets Manager, GCP Secret Manager, Doppler, sealed-secrets in K8s). Compose can consume Docker secrets; Kubernetes can mount them as files. |
-| **Network isolation** | All services share one bridge network on the host. | In K8s: separate namespaces, NetworkPolicies restricting forwarder → only egress to TTS + the Logstash port; Logstash → only ES; Kibana → only ES. Block lateral traffic. |
-| **TTS API key scope** | The README's quickstart asks for tenant-wide rights. | Provision a *service-account*-style user (collaborator-only, no Console login), grant it the minimum rights from §3, and rotate the key on a schedule. Audit the resulting events under `is.api_key.*`. |
-| **Encryption at rest** | The Elasticsearch volume is unencrypted on the host. | Use encrypted block storage (LUKS, EBS-encrypted, GCE PD with CMEK). Required for many compliance regimes. |
-| **Audit log** | Not enabled. | Turn on the [Elasticsearch audit log](https://www.elastic.co/guide/en/elasticsearch/reference/current/enable-audit-logging.html); ship Kibana access logs from the reverse proxy. |
+- Enable TLS on every hop. Don't expose Kibana on a public port without
+  an authenticating proxy in front of it.
+- Replace shared `elastic`-superuser credentials with least-privilege
+  service roles. Only the one-shot setup container needs admin rights.
+- Inject `TTS_API_KEY` and storage passwords from a secret store, not
+  from `.env`.
+- Restrict network paths so each service only reaches what it must.
+- Encrypt the storage volume.
+- Enable the storage tier's audit log, and ship access logs from your
+  proxy.
 
-### 10.2 Reliability and durability
+**Reliability**
 
-| Concern | What's wrong in the demo | What to do |
-|---|---|---|
-| **Forwarder → Logstash is a raw TCP socket** | If Logstash dies or restarts, the forwarder's `sendall` blocks; the TTS server-side per-subscriber buffer is bounded and old events are dropped, not retried. | Insert **Kafka or Redpanda** between the forwarder and Logstash. Forwarder writes to a topic with `acks=all`; Logstash's `kafka` input consumes with at-least-once semantics. The TTS `unique_id` → ES `_id` mapping makes any redelivery idempotent. |
-| **Single-node Elasticsearch** | One node = no HA, no quorum. A restart pauses ingest. | Run a 3-node cluster with dedicated master + data + (optionally) ingest roles. For managed offerings, use Elastic Cloud or [ECK](https://www.elastic.co/guide/en/cloud-on-k8s/current/index.html) on Kubernetes. |
-| **Forwarder is a single instance** | One container = SPOF. | Two patterns: **active-passive** with a leader-election sidecar (k8s `Lease`, etcd), simpler but with a fail-over gap; or **active-active** running multiple replicas — the `unique_id` dedup means duplicates collapse, but you spend 2× the API quota and TTS connections. Pick based on event-loss tolerance. |
-| **No snapshots** | The ES volume is a single point of data loss. | Register a snapshot repository (S3 / GCS / Azure / shared FS) and configure [SLM](https://www.elastic.co/guide/en/elasticsearch/reference/current/snapshot-lifecycle-management.html) to back up daily, with retention matching your compliance window. |
-| **Stack restarts lose in-flight data** | The TTS API has a small server-side buffer; a long forwarder outage means lost events. | If you can tolerate slightly higher start-up latency, persist the last `unique_id` you indexed and use the `after` parameter on the Events API to replay from there. (Not implemented here — the buffer is bounded server-side, so this only helps for outages of seconds-to-minutes.) |
-| **No backpressure visibility** | Forwarder, Logstash, and ES can each fall behind without alarming. | See [§10.4](#104-observability-of-the-pipeline-itself). |
+- The forwarder→Logstash hop is a raw TCP socket. Insert a durable
+  at-least-once queue between the forwarder and the indexer so that an
+  indexer outage doesn't translate to event loss. The `unique_id` → ES
+  `_id` mapping makes any redelivery idempotent.
+- Run the storage tier in HA. Schedule snapshot-based backups with
+  retention matching your compliance window.
+- The forwarder is stateless and idempotent end-to-end, so multiple
+  replicas can run active-active. Pick active-active or active-passive
+  based on event-loss tolerance — active-active doubles API quota and
+  TTS connections.
+- The TTS server-side buffer for events is bounded; long forwarder
+  outages drop old events on the server. Keep forwarder downtime
+  short, or implement a replay strategy keyed on `unique_id`.
 
-### 10.3 Scale and performance
+**Scale**
 
-The demo is single-node and will keep up with **tens of events/sec**.
-Beyond that:
+- Capacity sketch (compressed): ~600 B per IS event, ~1.5–2 KiB per
+  `as.up.data.forward`. A site with 10 000 active devices at one uplink
+  / 15 min generates ~30 events/s, ~3 GiB/day.
+- For higher rates: drop high-volume payload fields in the Logstash
+  filter (the `data` field of `as.up.data.forward` is most of the
+  bytes), sample chatty events, or split forwarders by event-name
+  regex (e.g. one for `^as\..+`, one for `^(ns|gs)\..+`).
 
-- **Capacity sketch.** Approximate sizes after compression:
-  - ~600 B / event for IS / lifecycle events.
-  - ~1.5–2 KiB / event for `as.up.forward` (carries the full `ApplicationUp` payload).
-  - 10 000 active devices at one uplink / 15 min ≈ 11 events/s from AS,
-    ~3× that across NS + GS — plan **~3 GiB/day** at 30 events/s sustained.
-- **Logstash.** Tune `pipeline.workers` (= CPU cores) and `pipeline.batch.size`
-  (default 125 → try 500–1000). Run multiple Logstash replicas behind a
-  load balancer or Kafka consumer group.
-- **ES sharding.** The default of 1 primary shard / 1 replica is fine up
-  to ~50 GiB/shard. Add primaries if a single shard becomes a bottleneck;
-  the ILM policy already rolls over at 20 GiB.
-- **Hot/warm/cold tiers.** With more than one data node, set
-  `index.routing.allocation.include._tier_preference` per ILM phase to
-  put older indices on cheaper hardware.
-- **Drop high-volume payload fields.** Most bytes are in `as.up.forward.data`.
-  If you don't need decoded payloads in ES (they're often available in
-  your application database):
-  ```ruby
-  if [name] == "as.up.forward" {
-    mutate { remove_field => ["[data][frm_payload]", "[data][decoded_payload]"] }
-  }
-  ```
-- **Sampling.** For chatty events that are useful in aggregate but not
-  individually (e.g. `gs.up.receive` at 100 ev/s), sample 1-in-N in the
-  Logstash filter to cap volume.
-- **Filter at the source.** `EVENT_NAMES_REGEX` lets the forwarder scope
-  the stream server-side. Splitting by component (one forwarder for
-  `^as\..+`, one for `^(ns|gs)\..+`) parallelises ingest and lets you
-  scale each axis independently.
+**Observability**
 
-### 10.4 Observability of the pipeline itself
+A silent pipeline looks the same as "nothing is happening." At minimum:
 
-If the pipeline silently stops, the absence of events looks the same as
-"nothing happened." Add:
+- One freshness alert: page when no events have been indexed for the
+  last few minutes ([§7.1](#71-an-example-alert-rule--ingest-lag) has an example rule).
+- Stack monitoring of the storage / pipeline / Kibana tier itself,
+  ideally writing to a different index from your event data so a
+  storage outage doesn't take its own observability with it.
 
-- **Stack monitoring.** Run [Metricbeat](https://www.elastic.co/guide/en/beats/metricbeat/current/metricbeat-module-elasticsearch.html)
-  or Elastic Agent against ES, Kibana, and Logstash; ship to a separate
-  monitoring cluster (or the same cluster with a dedicated data view).
-- **Lag alert.** A simple, high-signal alarm:
-  ```
-  max(now() - @timestamp) over logs-tts.events-* > 5m → page
-  ```
-  Implement as a Kibana threshold rule. This catches forwarder hangs,
-  TTS API outages, and Logstash backpressure with one signal.
-- **Forwarder metrics.** Add a Prometheus endpoint exposing event count,
-  drop count, current subscription state, and last-event timestamp per
-  kind. Not in the demo — the right place to add it is alongside
-  `LogstashSink` in `forwarder.py`.
-- **Diversity drop.** Alarm when the count of distinct `name`s per
-  10 min falls below your usual baseline — that catches "subscription
-  stalled but TCP still open" failure modes.
+**Compliance**
 
-### 10.5 Compliance and governance
+TTS events contain personal data (`user_id`, `remote_ip`, `user_agent`,
+device identifiers correlatable to physical hardware). Treat the index
+as a personal-data store.
 
-TTS events contain **personal data**: `user_id`, `remote_ip`,
-`user_agent`, sometimes device identifiers correlated to physical
-hardware. Treat the index as a personal-data store.
+- Retention by class. Admin/security events (`application.*`,
+  `gateway.*`, `user.*`, `oauth.*`, `*.api-key.*`, `*.collaborator.*`)
+  warrant longer retention than traffic events. The single
+  `RETENTION_DAYS` knob is the longer window; run a separate
+  delete-by-query for shorter classes.
+- Pseudonymise `remote_ip` (per-tenant salt + hash) if not required
+  for forensics. The Logstash filter already drops `authentication`
+  and `user_agent`.
+- Subscribe to `user.delete` events and cascade to a delete-by-query
+  on `user_id` to honour erasure requests.
+- Match storage region to TTS region if regulation requires it.
+- Note: purging an entity in TTS removes the entity, but events that
+  mentioned it remain indexed. Define a cross-system deletion policy
+  if you rely on this index for compliance reporting.
 
-- **Retention by class.** Different events warrant different retention.
-  Admin (`is.*`) and security events: 1+ year. Traffic events: weeks. Set
-  `RETENTION_DAYS` to the longer one and use a separate downstream
-  pipeline (or a delete-by-query schedule) to purge traffic earlier.
-- **Field redaction.** The Logstash filter already drops `authentication`
-  and `user_agent`. Consider also pseudonymising `remote_ip` (hash with a
-  per-tenant salt) if the IP isn't required for forensics.
-- **Access control.** Use Kibana **Spaces** to partition by tenant and
-  role-based **document-level security** to restrict who sees what.
-  Auditors get read-only on a redacted view.
-- **Data subject deletion.** When a user is deleted in TTS, you'll get
-  an `is.user.delete` event — pipe that into a delete-by-query against
-  `user_id` to honour erasure requests.
-- **Data residency.** Make sure your ES cluster lives in the same region
-  as the TTS deployment if regulation requires it (EU1 → EU; NAM1 → US).
+**Multi-tenancy**
 
-### 10.6 Multi-tenancy
+Run one forwarder per TTS tenant with that tenant's API key, and set
+`DATA_STREAM_NAMESPACE` so each tenant's events land in a distinct
+data stream. Enforce per-tenant access at the Kibana layer.
 
-If you collect events from multiple TTS tenants:
+**Lifecycle**
 
-- Run **one forwarder per tenant** with the tenant's own API key.
-- Set `data_stream_namespace` per tenant in `logstash/pipeline/tts-events.conf`,
-  e.g. `data_stream_namespace => "tenant-acme"` → events land in
-  `logs-tts.events-tenant-acme`.
-- Use **Kibana Spaces** + role-based DLS to partition who sees which
-  tenant's data.
-- Roll up cross-tenant dashboards in a dedicated admin space backed by
-  an index pattern of `logs-tts.events-*`.
-
-### 10.7 Lifecycle and change management
-
-- **TTS evolution.** New event names are added in nearly every TTS
-  release. Because the index template uses `dynamic: "true"`, new fields
-  appear automatically — but they may surprise dashboards built on a
-  fixed list of names. Check the [TTS release notes](https://www.thethingsindustries.com/docs/whats-new/)
-  on upgrade and review the [`pkg/events`](https://github.com/TheThingsNetwork/lorawan-stack/tree/main/pkg/events)
-  diff. Pin a known schema version into your CI.
-- **Stack upgrades.** Upgrade Elasticsearch, Kibana, and Logstash
-  in lockstep. Do a canary upgrade against a non-production index pattern
-  before the main cluster.
-- **Forwarder upgrades.** The forwarder is stateless, so rolling
-  restarts are safe; the TTS server-side buffer covers the disconnect.
-
-### 10.8 Recommended deployment patterns
-
-- **Kubernetes**: use the [Elastic Cloud on Kubernetes (ECK)](https://www.elastic.co/guide/en/cloud-on-k8s/current/index.html)
-  operator for ES + Kibana, deploy Logstash and the forwarder as
-  Deployments with HPA; everything else is roughly the same as this
-  Compose file. See `kibana/data-view.ndjson` for a saved-objects
-  example you can apply via [`kibana_saved_objects` API](https://www.elastic.co/guide/en/kibana/current/saved-objects-api.html).
-- **Elastic Cloud**: replace the `elasticsearch` and `kibana` services
-  with a managed deployment, point Logstash and the forwarder at the
-  Cloud endpoints with an API key, and you're done. The setup script
-  works unchanged against a managed cluster.
-- **Forwarder packaging**: this repo builds a single image. For larger
-  fleets, push it to a registry and pin the digest, since events get
-  reshaped between versions.
+New TTS event names appear in nearly every release. The index template
+uses `dynamic: true` so new fields appear automatically — but
+dashboards pinned to a fixed list of names will silently miss them.
+Review the TTS release notes on upgrade.
 
 ---
 
 ## 11. Appendix: useful event names
 
 A non-exhaustive cheat-sheet for filter building. The authoritative list
-lives in the TTS source under
-[`pkg/events`](https://github.com/TheThingsNetwork/lorawan-stack/tree/v3.30.0/pkg/events)
-and per-component event registrations.
+lives in the [The Things Stack Documentation](https://www.thethingsindustries.com/docs/api/reference/grpc/events/).
 
-| Component | Example event names | What they tell you |
-|---|---|---|
-| Identity Server (`is`) | `is.user.create`, `is.application.create`, `is.gateway.update`, `is.oauth.access_token.create` | Lifecycle and auth audit. |
-| Network Server (`ns`) | `ns.up.receive`, `ns.up.merge_metadata`, `ns.up.join.receive`, `ns.up.join.accept.forward`, `ns.down.schedule.attempt`, `ns.down.schedule.success`, `ns.mac.*` | LoRaWAN MAC layer. |
-| Application Server (`as`) | `as.up.forward`, `as.up.drop`, `as.up.data.forward`, `as.down.data.receive`, `as.down.data.forward` | What the application sees. |
-| Gateway Server (`gs`) | `gs.gateway.connect`, `gs.gateway.disconnect`, `gs.up.receive`, `gs.down.send`, `gs.status.receive` | Link health. |
-| Join Server (`js`) | `js.join.accept`, `js.join.reject` | Joins, including reasons. |
-| Packet Broker (`pba`) | `pba.uplink.forward`, `pba.downlink.receive` | Roaming traffic. |
+| Component                   | Example event names                                                                                                                                                                                  | What they tell you            |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| Identity Server (no prefix) | `application.create`, `user.update`, `gateway.delete`, `oauth.authorize`, `oauth.token.exchange`, `oauth.user.login`, `account.user.login_failed`, `gateway.api-key.create`, `gateway.collaborator.update` | Lifecycle and auth audit.     |
+| Network Server (`ns`)       | `ns.up.data.receive`, `ns.up.data.process`, `ns.up.join.receive`, `ns.up.join.accept.forward`, `ns.down.data.schedule.success`, `ns.mac.*`                                                          | LoRaWAN MAC layer.            |
+| Application Server (`as`)   | `as.up.data.forward`, `as.up.data.drop`, `as.up.join.forward`, `as.down.data.forward`, `as.webhook.fail`                                                                                            | What the application sees.    |
+| Gateway Server (`gs`)       | `gs.gateway.connect`, `gs.gateway.disconnect`, `gs.up.receive`, `gs.up.forward`, `gs.down.send`, `gs.status.receive`                                                                                 | Link health and traffic.      |
+| Join Server (`js`)          | `js.join.accept`, `js.join.reject`                                                                                                                                                                   | Joins, including reasons.     |
+| Device Claiming (`dcs`)     | `dcs.end_device.claim.success`, `dcs.gateway.claim.fail`                                                                                                                                             | Claim/unclaim flows.          |
+
+Identity Server events have **no `is.` prefix** — the IS emits names
+like `application.create`, `user.update`, `oauth.authorize` directly.
 
 Use these with the parsed prefix fields, e.g.:
 
