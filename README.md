@@ -1,5 +1,10 @@
 # tts-elk — log every The Things Stack event into ELK
 
+>[!IMPORTANT]
+Disclaimer: This repository is provided as a reference example to help users integrate The Things Stack with the Elastic Stack. It is not part of any The Things Industries product, and it is not covered by any commercial support agreement, SLA, or warranty, and is licensed under Apache 2.0 — meaning it is provided "AS IS", without warranties or conditions of any kind. The Things Industries accepts no liability for any damages arising from its use.
+
+
+
 A small, **end-to-end runnable** example that subscribes to the streaming
 [Events API](https://www.thethingsindustries.com/docs/api/reference/grpc/events/)
 of a [The Things Stack](https://www.thethingsindustries.com/docs/) (TTS)
